@@ -5,19 +5,21 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"github.com/qiniu/api.v7/auth/qbox"
-	"github.com/qiniu/api.v7/storage"
-	"github.com/spf13/viper"
-	"golang.org/x/net/context"
 	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/qiniu/api.v7/auth/qbox"
+	"github.com/qiniu/api.v7/storage"
+	"github.com/qiniu/log.v1"
+	"golang.org/x/net/context"
+	"qiniu.com/kodo/lib/cc/config"
 )
 
 var (
-	prepareLimit = 20
+	prepareLimit = 50
 )
 
 type Config struct {
@@ -29,6 +31,7 @@ type Config struct {
 	SecretKey    string
 	Endpoint     string
 	Suffix       string
+	Workers		 int
 }
 
 type uploadSvr struct {
@@ -43,6 +46,7 @@ type uploadSvr struct {
 	uploadedFiles map[string]struct{} //记录已经成功上传的文件，用于保证不会重复上传相同的文件
 	uploadedCount int                 //启动服务至今上传成功的文件个数
 	suffix        string
+	workers		  int
 }
 
 func New(conf Config) *uploadSvr {
@@ -58,6 +62,7 @@ func New(conf Config) *uploadSvr {
 		uploadedFiles: make(map[string]struct{}),
 		uploadedCount: 0,
 		suffix:        conf.Suffix,
+		workers:	   conf.Workers,
 	}
 }
 
@@ -76,17 +81,15 @@ func (s *uploadSvr) loopFindPDF() {
 				if isPrepared && !uploaded {
 					s.uploadedFiles[path] = struct{}{}
 					s.filesPrepared <- path
-				} else {
-					if !isPrepared {
-						fmt.Printf("[Info] %s not prepared.\n", path)
-					}
+				} else if !isPrepared {
+						log.Info(path ,"not prepared.")
 				}
 			}
 			return nil
 		})
-		fmt.Println("[Info] Searching for new PDF files...")
+		log.Info("Searching for new PDF files...")
 		if err != nil {
-			fmt.Printf("[Error] An error while walk the directory: %v \n", err)
+			log.Warn("An error while walk the directory:", err)
 			return
 		}
 		time.Sleep(time.Duration(s.walkInterval) * time.Second)
@@ -94,7 +97,8 @@ func (s *uploadSvr) loopFindPDF() {
 
 }
 
-func (s *uploadSvr) upload() {
+func (s *uploadSvr) upload(index int) {
+	log.Infof("Goroutine %d start.", index)
 	for path := range s.filesPrepared {
 		s.resumeUpload(path)
 	}
@@ -132,7 +136,7 @@ func (s *uploadSvr) resumeUpload(localFile string) {
 	// 我们这里采用 md5(bucket+key+local_path+local_file_last_modified)+".progress" 作为记录上传进度的文件名
 	fileInfo, statErr := os.Stat(localFile)
 	if statErr != nil {
-		fmt.Println("[Error] Local file state error:", statErr)
+		log.Error("Local file state error:", statErr)
 		return
 	}
 
@@ -144,7 +148,7 @@ func (s *uploadSvr) resumeUpload(localFile string) {
 	recordDir := filepath.Join(s.rootPath, "progress")
 	mErr := os.MkdirAll(recordDir, 0755)
 	if mErr != nil {
-		fmt.Println("[Error] Mkdir for record dir error:", mErr)
+		log.Error("Mkdir for record dir error:", mErr)
 		return
 	}
 
@@ -161,7 +165,7 @@ func (s *uploadSvr) resumeUpload(localFile string) {
 				// 检查context 是否过期，避免701错误
 				for _, item := range progressRecord.Progresses {
 					if storage.IsContextExpired(item) {
-						fmt.Println("[Info] Context exceed the time limit, expired at", item.ExpiredAt)
+						log.Info("Context exceed the time limit, expired at", item.ExpiredAt)
 						progressRecord.Progresses = make([]storage.BlkputRet, storage.BlockCount(fileSize))
 						break
 					}
@@ -174,7 +178,7 @@ func (s *uploadSvr) resumeUpload(localFile string) {
 	if len(progressRecord.Progresses) == 0 {
 		progressRecord.Progresses = make([]storage.BlkputRet, storage.BlockCount(fileSize))
 	} else {
-		fmt.Println("[Info] Restart upload from breakpoint...")
+		log.Info("Restart upload from breakpoint...")
 	}
 
 	resumeUploader := storage.NewResumeUploader(&cfg)
@@ -190,22 +194,23 @@ func (s *uploadSvr) resumeUpload(localFile string) {
 			//如果上传成功，则将进度序列化，然后写入文件
 			progressRecord.Progresses[blkIdx] = *ret
 			progressBytes, _ := json.Marshal(progressRecord)
-			fmt.Println("[Progress Saving] Write progress file", blkIdx, recordPath)
+			log.Info("Write progress file", blkIdx, recordPath)
 			wErr := ioutil.WriteFile(recordPath, progressBytes, 0644)
 			if wErr != nil {
-				fmt.Println("[Error] Write progress file error,", wErr)
+				log.Error("Write progress file error:", wErr)
 			}
 		},
 		UpHost: s.endpoint,
 	}
 	err := resumeUploader.PutFile(context.Background(), &ret, upToken, key, localFile, &putExtra)
 	if err != nil {
-		fmt.Println("[Failed] ", localFile, "upload failed.")
+		log.Error(localFile, "upload failed.")
 		return
 	}
 	delete(s.uploadedFiles, localFile)
 	s.uploadedCount++
-	fmt.Println("[Success] ", localFile, "upload succeed.", s.uploadedCount, "files have uploaded.")
+	log.Info(localFile, "upload succeed.")
+	log.Info(s.uploadedCount, "files have been uploaded.")
 
 	//删除源文件
 	os.Remove(localFile)
@@ -214,33 +219,24 @@ func (s *uploadSvr) resumeUpload(localFile string) {
 }
 
 func main() {
-	fmt.Println("[Info] Mission start.")
-	v := viper.New()
-	v.SetConfigName("config")
-	pwd, err := filepath.Abs(filepath.Dir(os.Args[0]))
-	if err != nil {
-		fmt.Printf("[Error] config load error: %v\n", err)
-		return
-	}
-
-	v.AddConfigPath(pwd)
-	v.SetConfigType("yaml")
-
-	if err = v.ReadInConfig(); err != nil {
-		fmt.Printf("[Error] config load error: %v\n", err)
-		return
-	}
-
+	log.Info("Mission start.")
 	var conf Config
-	err = v.Unmarshal(&conf)
-	if err != nil {
-		fmt.Printf("[Error] config load error: %v \n", err)
-		return
-	}
-	fmt.Println("[Info] Load config from path", filepath.Join(pwd, "config.yaml"))
-	svr := New(conf)
-	fmt.Println("[Info] Upload service initialized successfully.")
 
-	go svr.loopFindPDF()
-	svr.upload()
+	//cccfg
+	config.Init("f", "qbox", "uploader.conf")
+	if err := config.Load(&conf); err != nil {
+		log.Fatal("Config.Load failed:", err)
+	}
+
+	svr := New(conf)
+	log.Info("Upload service initialized successfully.")
+
+	// 上传Go程
+	for i := 0; i<svr.workers; i++ {
+		go svr.upload(i)
+	}
+
+	// 主线程遍历目录
+	svr.loopFindPDF()
+
 }

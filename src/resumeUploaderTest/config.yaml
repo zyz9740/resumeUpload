@@ -5,7 +5,7 @@ suffix:       ".pdf"
 # 两次遍历本地目录的时间间隔（秒）
 walkInterval: "10"
 # pdf文件稳定所需的时间（秒）
-preparedTime: "20"
+preparedTime: "30"
 # bucket的名称
 bucket:       "cadal-convert-pdf"
 # ak与sk
