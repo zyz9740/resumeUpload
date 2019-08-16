@@ -1,5 +1,5 @@
 # 放置 pdf 的路径
-path:         ".\\pdf"
+path:         "."
 # 后缀名过滤
 suffix:       ".pdf"
 # 两次遍历本地目录的时间间隔（秒）
@@ -12,4 +12,4 @@ bucket:       "cadal-convert-pdf"
 accessKey:    "-zTOh0QpMrfNR6B0tqs-UAH5z_PwndBD7wxcmYNs"
 secretKey:    "_BRyjK70psAaww7DiNifzfxOkbTO6_Bw28PbAnwm"
 # 加速域名
-endpoint:     "free-qvm-z0-xs.qiniup.com"
+endpoint:     "http://free-qvm-z0-xs.qiniup.com"
